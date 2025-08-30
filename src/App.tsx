@@ -1,6 +1,15 @@
 import { useState } from "react";
-import { ArrowUpTrayIcon, DocumentChartBarIcon } from "@heroicons/react/24/outline";
-import { BrowserRouter as Router, Routes, Route, useNavigate, useLocation } from "react-router-dom";
+import {
+  ArrowUpTrayIcon,
+  DocumentChartBarIcon,
+} from "@heroicons/react/24/outline";
+import {
+  BrowserRouter as Router,
+  Routes,
+  Route,
+  useNavigate,
+  useLocation,
+} from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import PreviewPage from "./PreviewPage";
 
@@ -10,7 +19,9 @@ function UploadPage() {
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
 
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = async (
+    e: React.ChangeEvent<HTMLInputElement>
+  ) => {
     if (e.target.files && e.target.files[0]) {
       const selectedFile = e.target.files[0];
       setFile(selectedFile);
@@ -88,26 +99,47 @@ function UploadPage() {
 
         {/* Preview Button */}
         <AnimatePresence>
-        {preview.length > 0 && (
-          <motion.div
-            className="mt-6 text-center"
-            initial={{ opacity: 0, scale: 0.8 }}
-            animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.8 }}
-            transition={{ duration: 0.4, ease: "easeOut" }}
-          >
-            <button
-              onClick={() => navigate("/preview", { state: { preview } })}
-              className="px-6 py-2 bg-green-600 text-white font-medium rounded-lg shadow hover:bg-green-700 transition"
+          {preview.length > 0 && (
+            <motion.div
+              className="mt-6 text-center"
+              initial={{ opacity: 0, scale: 0.8 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.8 }}
+              transition={{ duration: 0.4, ease: "easeOut" }}
             >
-              Show Preview
-            </button>
-          </motion.div>
-        )}
+              <button
+                onClick={() => navigate("/preview", { state: { preview } })}
+                className="px-6 py-2 bg-green-600 text-white font-medium rounded-lg shadow hover:bg-green-700 transition"
+              >
+                Show Preview
+              </button>
+            </motion.div>
+          )}
         </AnimatePresence>
       </div>
 
-      {loading && <p className="mt-6 text-gray-600">Loading preview...</p>}
+      {/* Animated Loader */}
+      {loading && (
+        <div className="mt-6 flex items-center gap-3 text-gray-600 justify-center">
+          <motion.svg
+            className="h-6 w-6 text-blue-500"
+            xmlns="http://www.w3.org/2000/svg"
+            fill="none"
+            viewBox="0 0 24 24"
+            stroke="currentColor"
+            animate={{ rotate: 360 }}
+            transition={{ repeat: Infinity, duration: 1, ease: "linear" }}
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M12 4v2m0 12v2m8-8h2M4 12H2m15.364-7.364l1.414 1.414M6.343 17.657l-1.414 1.414M17.657 17.657l1.414-1.414M6.343 6.343L4.929 4.929"
+            />
+          </motion.svg>
+          <p className="text-lg font-medium">Cleaning the data...</p>
+        </div>
+      )}
     </motion.div>
   );
 }
