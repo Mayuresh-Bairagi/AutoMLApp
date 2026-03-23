@@ -34,6 +34,19 @@ Start the development server:
 npm run dev
 ```
 
+### Backend Integration (Recommended)
+
+This frontend uses proxy-based API routing in development, so backend host details are not exposed in the UI.
+
+1. Set backend target via environment variable:
+   ```bash
+   VITE_BACKEND_URL=http://localhost:8000
+   ```
+2. Frontend calls use `/api/*` internally.
+3. Vite proxy forwards these to your backend server.
+
+This avoids hard-coding backend host values in user-facing screens.
+
 ### Building
 
 Build for production:

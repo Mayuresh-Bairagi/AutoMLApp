@@ -1,235 +1,385 @@
-import React, { useState } from "react";
-import { CloudArrowUpIcon, ArrowPathIcon, DocumentTextIcon } from "@heroicons/react/24/solid";
+import React, { useEffect, useMemo, useState } from "react";
+import {
+  ArrowPathIcon,
+  BoltIcon,
+  ChartBarSquareIcon,
+  ChatBubbleBottomCenterTextIcon,
+  CloudArrowUpIcon,
+  DocumentTextIcon,
+} from "@heroicons/react/24/solid";
 
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "/api";
 
-const BACKEND = "http://localhost:8000";
+type JsonRecord = Record<string, unknown>;
+type PreviewRow = Record<string, string | number | boolean | null>;
+type MLResultRecord = Record<string, unknown>;
+type ChartPayload = Record<string, unknown>;
 
-type PreviewRow = Record<string, any>;
-
-type UploadResponse = {
-  filename: string;
-  preview: PreviewRow[];
-  session_id: string;
+type ChatTurn = {
+  role: "user" | "assistant";
+  text: string;
 };
 
-type EDAResponse = {
-  session_id: string;
-  eda_html_path: string;
-};
+function extractErrorMessage(payload: unknown, fallback: string): string {
+  if (!payload || typeof payload !== "object") return fallback;
+  const asRecord = payload as Record<string, unknown>;
+  const detail = asRecord.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail) && detail.length > 0) return JSON.stringify(detail);
+  const message = asRecord.message;
+  if (typeof message === "string") return message;
+  return fallback;
+}
 
-type MLResultRecord = Record<string, any>; // depends on your results_df columns
+function toFullUrl(pathOrUrl: string): string {
+  if (!pathOrUrl) return "";
+  if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
+    return pathOrUrl;
+  }
+  if (pathOrUrl.startsWith("/")) return `${API_BASE}${pathOrUrl}`;
+  return `${API_BASE}/${pathOrUrl}`;
+}
 
-type MLModelsResponse = {
-  session_id: string;
-  results: MLResultRecord[];
-  model_paths: string[]; // could be relative like "data/session_id/file.pkl" or full URL
-};
+async function safeJson(response: Response): Promise<unknown> {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
 
-export default function AutoMLDashboard(): JSX.Element {
+export default function AutoMLDashboard(): React.ReactElement {
+  const [backendStatus, setBackendStatus] = useState<"checking" | "up" | "down">("checking");
   const [file, setFile] = useState<File | null>(null);
   const [fileName, setFileName] = useState<string>("");
   const [preview, setPreview] = useState<PreviewRow[]>([]);
   const [sessionId, setSessionId] = useState<string>("");
-  const [loadingUpload, setLoadingUpload] = useState<boolean>(false);
-  const [loadingEDA, setLoadingEDA] = useState<boolean>(false);
-  const [edaUrl, setEdaUrl] = useState<string>("");
+
   const [problemStatement, setProblemStatement] = useState<string>("regression");
-  const [loadingML, setLoadingML] = useState<boolean>(false);
+  const [targetColumn, setTargetColumn] = useState<string>("");
+  const [edaUrl, setEdaUrl] = useState<string>("");
   const [mlResults, setMlResults] = useState<MLResultRecord[]>([]);
   const [modelPaths, setModelPaths] = useState<string[]>([]);
+
+  const [agentOutput, setAgentOutput] = useState<JsonRecord | null>(null);
+  const [chatQuestion, setChatQuestion] = useState<string>("");
+  const [chatHistory, setChatHistory] = useState<ChatTurn[]>([]);
+  const [chartPrompt, setChartPrompt] = useState<string>("Build key distribution and correlation charts.");
+  const [chartPayload, setChartPayload] = useState<ChartPayload[] | null>(null);
+
+  const [busy, setBusy] = useState<string>("");
   const [error, setError] = useState<string>("");
 
-  // helpers
-  const getFullUrl = (path: string) => {
-    if (!path) return "";
-    if (path.startsWith("http://") || path.startsWith("https://")) return path;
-    // backend serves static files under /data -> ensure full absolute path
-    if (path.startsWith("/")) return `${BACKEND}${path}`;
-    return `${BACKEND}/${path}`;
+  const previewColumns = useMemo(() => {
+    if (preview.length === 0) return [] as string[];
+    return Object.keys(preview[0]);
+  }, [preview]);
+
+  useEffect(() => {
+    const checkHealth = async () => {
+      try {
+        const resp = await fetch(`${API_BASE}/`, { method: "GET" });
+        setBackendStatus(resp.ok ? "up" : "down");
+      } catch {
+        setBackendStatus("down");
+      }
+    };
+    void checkHealth();
+  }, []);
+
+  const ensureSession = (): boolean => {
+    if (!sessionId) {
+      setError("Upload a dataset first to create a session.");
+      return false;
+    }
+    return true;
   };
 
-  // File select
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    setError("");
-    const f = e.target.files?.[0] ?? null;
-    setFile(f);
-    setFileName(f?.name ?? "");
-    // Reset preview/previous state
-    setPreview([]);
-    setSessionId("");
+  const resetRunArtifacts = () => {
     setEdaUrl("");
     setMlResults([]);
     setModelPaths([]);
+    setAgentOutput(null);
+    setChatHistory([]);
+    setChartPayload(null);
   };
 
-  // Upload
+  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    setError("");
+    const picked = event.target.files?.[0] ?? null;
+    setFile(picked);
+    setFileName(picked?.name ?? "");
+  };
+
   const handleUpload = async () => {
     setError("");
     if (!file) {
-      setError("Please select a CSV or Excel file first.");
+      setError("Select a CSV or Excel file first.");
       return;
     }
 
-    const fd = new FormData();
-    fd.append("file", file);
-
-    setLoadingUpload(true);
+    setBusy("upload");
+    resetRunArtifacts();
     setPreview([]);
-    setEdaUrl("");
     setSessionId("");
-    setMlResults([]);
-    setModelPaths([]);
+
+    const formData = new FormData();
+    formData.append("file", file);
 
     try {
-      const resp = await fetch(`${BACKEND}/upload`, {
+      const resp = await fetch(`${API_BASE}/upload`, {
         method: "POST",
-        body: fd,
+        body: formData,
       });
-      const data: UploadResponse | { detail?: string } = await resp.json();
+      const payload = (await safeJson(resp)) as Record<string, unknown> | null;
       if (!resp.ok) {
-        const msg = (data as any).detail || "Upload failed";
-        setError(msg);
+        setError(extractErrorMessage(payload, "Upload failed."));
         return;
       }
-      setPreview((data as UploadResponse).preview || []);
-      setFileName((data as UploadResponse).filename || file.name);
-      setSessionId((data as UploadResponse).session_id || "");
-    } catch (err: any) {
-      console.error("Upload error:", err);
-      setError("Failed to connect to backend. Is it running on http://localhost:8000 ?");
+
+      const rows = (payload?.preview as PreviewRow[]) ?? [];
+      const newSession =
+        (payload?.session_id as string | undefined) ??
+        (payload?.sessionId as string | undefined) ??
+        "";
+      setPreview(Array.isArray(rows) ? rows : []);
+      setSessionId(newSession);
+      setFileName((payload?.filename as string | undefined) ?? file.name);
+    } catch {
+      setError("Could not connect to backend. Verify API is running.");
     } finally {
-      setLoadingUpload(false);
+      setBusy("");
     }
   };
 
-  // Generate EDA
   const handleGenerateEDA = async () => {
     setError("");
-    if (!sessionId) {
-      setError("Upload a dataset first to generate EDA.");
-      return;
-    }
-    setLoadingEDA(true);
+    if (!ensureSession()) return;
+    setBusy("eda");
     setEdaUrl("");
+
     try {
-      const resp = await fetch(`${BACKEND}/eda`, {
+      const resp = await fetch(`${API_BASE}/eda`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId }),
       });
-      const data: EDAResponse | { detail?: string } = await resp.json();
+      const payload = (await safeJson(resp)) as Record<string, unknown> | null;
       if (!resp.ok) {
-        setError((data as any).detail || "EDA generation failed");
+        setError(extractErrorMessage(payload, "EDA generation failed."));
         return;
       }
-      const url = (data as EDAResponse).eda_html_path || `${BACKEND}/data/${sessionId}/index.html`;
-      setEdaUrl(url);
-      // open automatically in new tab (optional) - comment out if you want manual open
-      window.open(getFullUrl(url), "_blank");
-    } catch (err) {
-      console.error("EDA error:", err);
-      setError("Failed to generate EDA. Check backend logs.");
+
+      const path =
+        (payload?.eda_html_path as string | undefined) ??
+        (payload?.report_url as string | undefined) ??
+        (payload?.url as string | undefined) ??
+        "";
+      if (!path) {
+        setError("EDA created, but no report URL was returned.");
+        return;
+      }
+      setEdaUrl(path);
+      window.open(toFullUrl(path), "_blank", "noopener,noreferrer");
+    } catch {
+      setError("Failed to generate EDA report.");
     } finally {
-      setLoadingEDA(false);
+      setBusy("");
     }
   };
 
-  // Train ML models
   const handleTrainModels = async () => {
     setError("");
-    if (!sessionId) {
-      setError("Upload dataset first before training models.");
-      return;
-    }
-    if (!problemStatement || problemStatement.trim().length === 0) {
-      setError("Provide a problem statement (e.g., regression, classification).");
+    if (!ensureSession()) return;
+    if (!problemStatement.trim()) {
+      setError("Problem statement is required.");
       return;
     }
 
-    setLoadingML(true);
+    setBusy("ml");
     setMlResults([]);
     setModelPaths([]);
 
+    const body: Record<string, string> = {
+      session_id: sessionId,
+      problem_statement: problemStatement.trim(),
+    };
+    if (targetColumn.trim()) body.target_column = targetColumn.trim();
+
     try {
-      const resp = await fetch(`${BACKEND}/ml-models`, {
+      const resp = await fetch(`${API_BASE}/ml-models`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, problem_statement: problemStatement }),
+        body: JSON.stringify(body),
       });
-      const data: MLModelsResponse | { detail?: string } = await resp.json();
+      const payload = (await safeJson(resp)) as Record<string, unknown> | null;
       if (!resp.ok) {
-        setError((data as any).detail || "Model training failed");
+        setError(extractErrorMessage(payload, "Model training failed."));
         return;
       }
-      const mr = data as MLModelsResponse;
-      setMlResults(mr.results || []);
-      setModelPaths(mr.model_paths || []);
-      // Optionally show success toast or auto-download first model
-    } catch (err) {
-      console.error("ML training error:", err);
-      setError("Failed to start model training. Check backend logs.");
+
+      const results = (payload?.results as MLResultRecord[]) ?? [];
+      const paths = (payload?.model_paths as string[]) ?? [];
+      setMlResults(Array.isArray(results) ? results : []);
+      setModelPaths(Array.isArray(paths) ? paths : []);
+    } catch {
+      setError("Training request failed.");
     } finally {
-      setLoadingML(false);
+      setBusy("");
+    }
+  };
+
+  const handleRunAgent = async () => {
+    setError("");
+    if (!ensureSession()) return;
+    setBusy("agent");
+    setAgentOutput(null);
+
+    const body: Record<string, string> = { session_id: sessionId };
+    if (problemStatement.trim()) body.problem_statement = problemStatement.trim();
+    if (targetColumn.trim()) body.target_column = targetColumn.trim();
+
+    try {
+      const resp = await fetch(`${API_BASE}/agent/run`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const payload = (await safeJson(resp)) as JsonRecord | null;
+      if (!resp.ok) {
+        setError(extractErrorMessage(payload, "Agent run failed."));
+        return;
+      }
+      setAgentOutput(payload ?? {});
+    } catch {
+      setError("Agent pipeline request failed.");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const handleAskChat = async () => {
+    setError("");
+    if (!ensureSession()) return;
+    if (!chatQuestion.trim()) {
+      setError("Enter a dataset question before sending.");
+      return;
+    }
+
+    const question = chatQuestion.trim();
+    setBusy("chat");
+    setChatQuestion("");
+    setChatHistory((prev) => [...prev, { role: "user", text: question }]);
+
+    try {
+      const resp = await fetch(`${API_BASE}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id: sessionId, question }),
+      });
+      const payload = (await safeJson(resp)) as Record<string, unknown> | null;
+      if (!resp.ok) {
+        setError(extractErrorMessage(payload, "Chat request failed."));
+        return;
+      }
+      const answer =
+        (payload?.answer as string | undefined) ??
+        (payload?.response as string | undefined) ??
+        (payload?.message as string | undefined) ??
+        JSON.stringify(payload, null, 2);
+      setChatHistory((prev) => [...prev, { role: "assistant", text: answer }]);
+    } catch {
+      setError("Could not fetch chat response from backend.");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  const handleGenerateCharts = async () => {
+    setError("");
+    if (!ensureSession()) return;
+    setBusy("charts");
+    setChartPayload(null);
+
+    const body: Record<string, string> = { session_id: sessionId };
+    if (chartPrompt.trim()) body.prompt = chartPrompt.trim();
+
+    try {
+      const resp = await fetch(`${API_BASE}/dashboard/charts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const payload = (await safeJson(resp)) as Record<string, unknown> | null;
+      if (!resp.ok) {
+        setError(extractErrorMessage(payload, "Chart generation failed."));
+        return;
+      }
+
+      const charts = payload?.charts;
+      if (Array.isArray(charts)) {
+        setChartPayload(charts as ChartPayload[]);
+      } else if (payload) {
+        setChartPayload([payload as ChartPayload]);
+      } else {
+        setChartPayload([]);
+      }
+    } catch {
+      setError("Failed to generate charts.");
+    } finally {
+      setBusy("");
     }
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-purple-50 to-blue-50 p-8 flex flex-col items-center">
-      <div className="w-full max-w-4xl bg-white rounded-2xl shadow-xl p-8 border border-gray-200">
-        <header className="flex items-center justify-between mb-6">
-          <div>
-            <h1 className="text-3xl font-bold text-gray-800">AutoML Dashboard</h1>
-            <p className="text-sm text-gray-500 mt-1">
-              Upload dataset → preview → generate EDA → train ML models
-            </p>
-          </div>
-          <div className="text-right">
-            <p className="text-xs text-gray-400">Backend:</p>
-            <p className="text-sm font-mono text-gray-600">{BACKEND}</p>
+    <div className="min-h-screen bg-[radial-gradient(circle_at_top,_#f0f9ff_0%,_#fff7ed_55%,_#fffbeb_100%)] px-4 py-8 sm:px-8">
+      <div className="mx-auto w-full max-w-6xl">
+        <header className="mb-6 rounded-3xl border border-slate-200 bg-white/80 p-6 shadow-lg backdrop-blur">
+          <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+            <div>
+              <h1 className="text-3xl font-bold tracking-tight text-slate-800">AutoML Agnetic AI Frontend</h1>
+              <p className="mt-1 text-sm text-slate-600">
+                Upload dataset, generate EDA, train models, run agent pipeline, ask chat questions, and generate dashboard charts.
+              </p>
+            </div>
+            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm">
+              <div className="font-medium text-slate-700">API Base</div>
+              <div className="font-mono text-xs text-slate-600 break-all">{API_BASE}</div>
+              <div className="mt-1 text-xs">
+                Backend Status:{" "}
+                <span
+                  className={`font-semibold ${
+                    backendStatus === "up"
+                      ? "text-emerald-600"
+                      : backendStatus === "down"
+                      ? "text-rose-600"
+                      : "text-amber-600"
+                  }`}
+                >
+                  {backendStatus === "checking" ? "Checking" : backendStatus === "up" ? "Healthy" : "Unavailable"}
+                </span>
+              </div>
+            </div>
           </div>
         </header>
 
-        {/* Upload */}
-        <section className="mb-6">
-          <label className="flex items-center gap-4 p-4 rounded-lg border border-dashed border-purple-300 bg-purple-50 hover:bg-purple-100 transition cursor-pointer">
-            <CloudArrowUpIcon className="h-12 w-12 text-purple-600" />
-            <div className="flex-1">
-              <div className="flex items-center gap-2">
-                <div className="text-gray-700 font-medium">
-                  {file ? file.name : "Choose a CSV / Excel file"}
-                </div>
-                {file && (
-                  <div className="text-xs text-gray-500 font-mono ml-2">({file.type || "file"})</div>
-                )}
+        <section className="mb-5 rounded-3xl border border-orange-100 bg-white p-5 shadow-sm">
+          <div className="flex flex-col gap-4 lg:flex-row lg:items-end">
+            <label className="flex flex-1 cursor-pointer items-center gap-4 rounded-2xl border border-dashed border-orange-300 bg-orange-50 p-4 transition hover:bg-orange-100">
+              <CloudArrowUpIcon className="h-10 w-10 text-orange-500" />
+              <div>
+                <div className="font-semibold text-slate-700">{file ? file.name : "Choose .csv, .xlsx or .xls"}</div>
+                <div className="text-xs text-slate-500">Click to select a local dataset file</div>
               </div>
-              <div className="text-xs text-gray-500 mt-1">
-                Click here or drag & drop (drag & drop not implemented — click to choose)
-              </div>
-            </div>
-            <input
-              type="file"
-              accept=".csv,.xlsx,.xls"
-              onChange={handleFileChange}
-              className="hidden"
-            />
-          </label>
+              <input type="file" accept=".csv,.xlsx,.xls" onChange={handleFileChange} className="hidden" />
+            </label>
 
-          <div className="mt-4 flex gap-3">
             <button
               onClick={handleUpload}
-              disabled={loadingUpload}
-              className={`px-4 py-2 rounded-lg text-white font-medium ${
-                loadingUpload ? "bg-purple-400 cursor-not-allowed" : "bg-purple-600 hover:bg-purple-700"
-              }`}
+              disabled={busy === "upload"}
+              className="rounded-xl bg-orange-500 px-5 py-3 text-sm font-semibold text-white transition hover:bg-orange-600 disabled:cursor-not-allowed disabled:opacity-60"
             >
-              {loadingUpload ? (
-                <span className="flex items-center gap-2">
-                  <ArrowPathIcon className="h-4 w-4 animate-spin" />
-                  Uploading...
-                </span>
-              ) : (
-                "Upload & Preview"
-              )}
+              {busy === "upload" ? "Uploading" : "Upload Dataset"}
             </button>
 
             <button
@@ -238,213 +388,296 @@ export default function AutoMLDashboard(): JSX.Element {
                 setFileName("");
                 setPreview([]);
                 setSessionId("");
-                setEdaUrl("");
-                setMlResults([]);
-                setModelPaths([]);
                 setError("");
+                resetRunArtifacts();
               }}
-              className="px-4 py-2 rounded-lg bg-gray-100 hover:bg-gray-200"
+              className="rounded-xl bg-slate-100 px-5 py-3 text-sm font-semibold text-slate-700 transition hover:bg-slate-200"
             >
-              Reset
+              Reset Workspace
             </button>
           </div>
 
-          {error && <div className="mt-3 text-sm text-red-600">{error}</div>}
-        </section>
-
-        {/* Preview */}
-        <section className="mb-6">
-          <div className="border rounded-lg overflow-hidden">
-            <div className="bg-gray-50 p-3 border-b">
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-sm font-semibold text-gray-700">{fileName || "No file uploaded"}</div>
-                  <div className="text-xs text-gray-500">Session: <span className="font-mono">{sessionId || "-"}</span></div>
-                </div>
-                <div className="text-xs text-gray-500">Preview (top rows)</div>
-              </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-2">
+            <div className="rounded-xl bg-slate-50 p-3 text-sm">
+              <span className="font-semibold text-slate-700">File:</span>{" "}
+              <span className="text-slate-600">{fileName || "Not uploaded"}</span>
             </div>
-
-            <div className="p-4">
-              {preview.length === 0 ? (
-                <div className="text-sm text-gray-500">No preview available. Upload a file to see the preview.</div>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="min-w-full divide-y divide-gray-200">
-                    <thead className="bg-gray-100">
-                      <tr>
-                        {Object.keys(preview[0]).map((col) => (
-                          <th key={col} className="px-4 py-2 text-left text-xs font-semibold text-gray-600 uppercase">
-                            {col}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-gray-100">
-                      {preview.map((row, i) => (
-                        <tr key={i} className="hover:bg-gray-50">
-                          {Object.values(row).map((val, j) => (
-                            <td key={j} className="px-4 py-2 text-sm text-gray-700 whitespace-nowrap">
-                              {String(val)}
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
+            <div className="rounded-xl bg-slate-50 p-3 text-sm">
+              <span className="font-semibold text-slate-700">Session ID:</span>{" "}
+              <span className="font-mono text-slate-600 break-all">{sessionId || "-"}</span>
             </div>
           </div>
+
+          {error && (
+            <div className="mt-4 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+              {error}
+            </div>
+          )}
         </section>
 
-        {/* EDA & ML Controls */}
-        <section className="mb-6 grid grid-cols-1 md:grid-cols-2 gap-4">
-          {/* EDA */}
-          <div className="bg-white border rounded-lg p-4">
-            <h3 className="text-sm font-semibold text-gray-700 mb-2">Exploratory Data Analysis (EDA)</h3>
-            <p className="text-xs text-gray-500 mb-3">Generate and open an interactive EDA HTML report.</p>
+        <section className="mb-5 rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-lg font-bold text-slate-800">Dataset Preview</h2>
+            {previewColumns.length > 10 && <span className="text-xs text-slate-600">Use touchpad horizontal swipe to view all columns.</span>}
+          </div>
 
-            <div className="flex items-center gap-2">
+          {preview.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-6 text-sm text-slate-500">
+              Upload a dataset to view preview rows.
+            </div>
+          ) : (
+            <div className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+              <div className="max-w-full overflow-x-auto" style={{ touchAction: "pan-x" }}>
+                <table className="w-full min-w-[1400px] table-fixed divide-y divide-slate-200 text-sm">
+                  <thead className="bg-slate-100">
+                  <tr>
+                    {previewColumns.map((column) => (
+                      <th key={column} className="whitespace-nowrap px-4 py-2 text-left font-semibold text-slate-700">
+                        {column}
+                      </th>
+                    ))}
+                  </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 bg-white">
+                    {preview.map((row, rowIndex) => (
+                      <tr key={rowIndex} className="hover:bg-slate-50">
+                        {previewColumns.map((column) => (
+                          <td key={`${column}-${rowIndex}`} className="max-w-44 truncate whitespace-nowrap px-4 py-2 text-slate-700" title={String(row[column] ?? "")}>
+                          {String(row[column] ?? "")}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="border-t border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
+                Showing {preview.length} rows and {previewColumns.length} columns.
+              </div>
+            </div>
+          )}
+        </section>
+
+        <section className="mb-5 grid gap-5 lg:grid-cols-2">
+          <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h3 className="mb-3 flex items-center gap-2 text-base font-bold text-slate-800">
+              <DocumentTextIcon className="h-5 w-5 text-cyan-600" />
+              EDA and Model Training
+            </h3>
+            <div className="space-y-3">
               <button
                 onClick={handleGenerateEDA}
-                disabled={loadingEDA}
-                className={`px-3 py-2 rounded-md text-white font-medium ${
-                  loadingEDA ? "bg-purple-400 cursor-not-allowed" : "bg-indigo-600 hover:bg-indigo-700"
-                }`}
+                disabled={busy === "eda"}
+                className="w-full rounded-xl bg-cyan-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-cyan-700 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {loadingEDA ? "Generating..." : "Generate EDA"}
+                {busy === "eda" ? "Generating EDA" : "Generate EDA Report"}
               </button>
 
               {edaUrl && (
                 <a
-                  href={getFullUrl(edaUrl)}
+                  href={toFullUrl(edaUrl)}
                   target="_blank"
                   rel="noreferrer"
-                  className="px-3 py-2 rounded-md bg-blue-600 text-white text-sm hover:bg-blue-700"
+                  className="inline-block rounded-xl bg-cyan-100 px-4 py-2 text-sm font-semibold text-cyan-700 hover:bg-cyan-200"
                 >
-                  Open EDA Report
+                  Open EDA HTML
                 </a>
               )}
+
+              <div className="grid gap-2 sm:grid-cols-2">
+                <input
+                  value={problemStatement}
+                  onChange={(event) => setProblemStatement(event.target.value)}
+                  placeholder="classification or regression"
+                  className="rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none ring-0 focus:border-cyan-500"
+                />
+                <input
+                  value={targetColumn}
+                  onChange={(event) => setTargetColumn(event.target.value)}
+                  placeholder="Optional target column"
+                  className="rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none ring-0 focus:border-cyan-500"
+                />
+              </div>
+
+              <button
+                onClick={handleTrainModels}
+                disabled={busy === "ml"}
+                className="w-full rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {busy === "ml" ? "Training Models" : "Run /ml-models"}
+              </button>
             </div>
           </div>
 
-          {/* ML Models */}
-          <div className="bg-white border rounded-lg p-4">
-            <h3 className="text-sm font-semibold text-gray-700 mb-2">Train ML Models</h3>
-            <p className="text-xs text-gray-500 mb-3">
-              Provide a short problem statement (e.g., <code>regression</code>, <code>classification</code>).
+          <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h3 className="mb-3 flex items-center gap-2 text-base font-bold text-slate-800">
+              <BoltIcon className="h-5 w-5 text-amber-600" />
+              Agentic Pipeline
+            </h3>
+            <p className="mb-3 text-sm text-slate-600">
+              Executes the full LangGraph workflow via /agent/run using current session context.
             </p>
-
-            <div className="flex flex-col gap-2">
-              <input
-                value={problemStatement}
-                onChange={(e) => setProblemStatement(e.target.value)}
-                placeholder="e.g., regression"
-                className="px-3 py-2 border rounded-md"
-              />
-
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={handleTrainModels}
-                  disabled={loadingML}
-                  className={`px-3 py-2 rounded-md text-white font-medium ${
-                    loadingML ? "bg-purple-400 cursor-not-allowed" : "bg-green-600 hover:bg-green-700"
-                  }`}
-                >
-                  {loadingML ? "Training..." : "Train Models"}
-                </button>
-
-                <button
-                  onClick={() => {
-                    setMlResults([]);
-                    setModelPaths([]);
-                  }}
-                  className="px-3 py-2 rounded-md bg-gray-100 hover:bg-gray-200"
-                >
-                  Clear Results
-                </button>
-              </div>
-
-              <div className="text-xs text-gray-400">Training may take time depending on your backend setting.</div>
-            </div>
+            <button
+              onClick={handleRunAgent}
+              disabled={busy === "agent"}
+              className="w-full rounded-xl bg-amber-500 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-amber-600 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {busy === "agent" ? "Running Agent" : "Run Agent Pipeline"}
+            </button>
+            {agentOutput && (
+              <pre className="mt-3 max-h-64 overflow-auto rounded-xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-700">
+                {JSON.stringify(agentOutput, null, 2)}
+              </pre>
+            )}
           </div>
         </section>
 
-        {/* ML Results */}
-        <section>
-          {loadingML && (
-            <div className="text-sm text-gray-600 mb-2">Training in progress... check backend logs for more details.</div>
+        <section className="mb-5 grid gap-5 lg:grid-cols-2">
+          <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h3 className="mb-3 flex items-center gap-2 text-base font-bold text-slate-800">
+              <ChatBubbleBottomCenterTextIcon className="h-5 w-5 text-teal-600" />
+              Dataset Q&A
+            </h3>
+            <div className="mb-3 flex gap-2">
+              <input
+                value={chatQuestion}
+                onChange={(event) => setChatQuestion(event.target.value)}
+                placeholder="Ask about trends, anomalies, or feature relationships"
+                className="flex-1 rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:border-teal-500"
+              />
+              <button
+                onClick={handleAskChat}
+                disabled={busy === "chat"}
+                className="rounded-xl bg-teal-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {busy === "chat" ? "Sending" : "Ask"}
+              </button>
+            </div>
+
+            <div className="max-h-72 space-y-2 overflow-auto rounded-xl border border-slate-200 bg-slate-50 p-3">
+              {chatHistory.length === 0 && <div className="text-sm text-slate-500">No messages yet.</div>}
+              {chatHistory.map((turn, index) => (
+                <div
+                  key={`${turn.role}-${index}`}
+                  className={`rounded-lg px-3 py-2 text-sm ${
+                    turn.role === "user" ? "bg-teal-100 text-teal-800" : "bg-white text-slate-700"
+                  }`}
+                >
+                  <div className="mb-1 text-xs font-semibold uppercase opacity-70">{turn.role}</div>
+                  <div className="whitespace-pre-wrap">{turn.text}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h3 className="mb-3 flex items-center gap-2 text-base font-bold text-slate-800">
+              <ChartBarSquareIcon className="h-5 w-5 text-indigo-600" />
+              Dashboard Chart Specs
+            </h3>
+            <textarea
+              value={chartPrompt}
+              onChange={(event) => setChartPrompt(event.target.value)}
+              rows={3}
+              className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm outline-none focus:border-indigo-500"
+              placeholder="Describe chart requirements for backend to generate Plotly specifications"
+            />
+            <button
+              onClick={handleGenerateCharts}
+              disabled={busy === "charts"}
+              className="mt-3 w-full rounded-xl bg-indigo-600 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {busy === "charts" ? "Generating Charts" : "Run /dashboard/charts"}
+            </button>
+
+            {chartPayload && (
+              <div className="mt-3 space-y-2">
+                {chartPayload.length === 0 && <div className="text-sm text-slate-500">No chart payload returned.</div>}
+                {chartPayload.map((chart, index) => {
+                  const title =
+                    (chart.title as string | undefined) ??
+                    (chart.name as string | undefined) ??
+                    `Chart ${index + 1}`;
+                  const type = (chart.type as string | undefined) ?? "unknown";
+                  return (
+                    <details key={index} className="rounded-xl border border-slate-200 bg-slate-50 p-3">
+                      <summary className="cursor-pointer text-sm font-semibold text-slate-700">
+                        {title} • {type}
+                      </summary>
+                      <pre className="mt-2 max-h-48 overflow-auto text-xs text-slate-700">
+                        {JSON.stringify(chart, null, 2)}
+                      </pre>
+                    </details>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </section>
+
+        <section className="rounded-3xl border border-slate-200 bg-white p-5 shadow-sm">
+          <h3 className="mb-3 flex items-center gap-2 text-base font-bold text-slate-800">
+            <DocumentTextIcon className="h-5 w-5 text-emerald-700" />
+            Model Training Output
+          </h3>
+
+          {busy === "ml" && (
+            <div className="mb-3 flex items-center gap-2 text-sm text-slate-600">
+              <ArrowPathIcon className="h-4 w-4 animate-spin" />
+              Model training is running
+            </div>
           )}
 
-          {mlResults.length > 0 && (
-            <div className="mb-4 border rounded-lg overflow-hidden">
-              <div className="bg-gray-50 p-3 border-b">
-                <div className="flex items-center gap-2">
-                  <DocumentTextIcon className="h-5 w-5 text-gray-600" />
-                  <h4 className="text-sm font-semibold text-gray-700">Model Training Results</h4>
-                </div>
-              </div>
-
-              <div className="p-4 overflow-x-auto">
-                <table className="min-w-full divide-y divide-gray-200">
-                  <thead className="bg-gray-100">
-                    <tr>
-                      {Object.keys(mlResults[0]).map((col) => (
-                        <th key={col} className="px-3 py-2 text-left text-xs font-semibold text-gray-600">
-                          {col}
-                        </th>
+          {mlResults.length > 0 ? (
+            <div className="overflow-x-auto rounded-xl border border-slate-200">
+              <table className="min-w-full divide-y divide-slate-200 text-sm">
+                <thead className="bg-slate-100">
+                  <tr>
+                    {Object.keys(mlResults[0]).map((column) => (
+                      <th key={column} className="px-3 py-2 text-left font-semibold text-slate-700">
+                        {column}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100 bg-white">
+                  {mlResults.map((row, rowIndex) => (
+                    <tr key={rowIndex} className="hover:bg-slate-50">
+                      {Object.keys(mlResults[0]).map((column) => (
+                        <td key={`${column}-${rowIndex}`} className="px-3 py-2 text-slate-700">
+                          {String(row[column] ?? "")}
+                        </td>
                       ))}
                     </tr>
-                  </thead>
-                  <tbody className="divide-y divide-gray-100">
-                    {mlResults.map((row, i) => (
-                      <tr key={i} className="hover:bg-gray-50">
-                        {Object.values(row).map((val, j) => (
-                          <td key={j} className="px-3 py-2 text-sm text-gray-700">
-                            {String(val)}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          ) : (
+            <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-500">
+              No model metrics yet.
             </div>
           )}
 
           {modelPaths.length > 0 && (
-            <div className="mb-4 border rounded-lg p-4 bg-white">
-              <h4 className="text-sm font-semibold text-gray-700 mb-2">Model Files</h4>
-              <div className="flex flex-col gap-2">
-                {modelPaths.map((p, idx) => {
-                  const url = getFullUrl(p);
-                  return (
-                    <div key={idx} className="flex items-center justify-between gap-4">
-                      <div className="text-sm text-gray-700 break-all">{p}</div>
-                      <div className="flex items-center gap-2">
-                        <a
-                          href={url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="px-3 py-1 rounded-md bg-blue-600 text-white text-sm hover:bg-blue-700"
-                        >
-                          Open
-                        </a>
-                        <button
-                          onClick={() => {
-                            // force download by opening the url (server must set proper headers)
-                            window.open(url, "_blank");
-                          }}
-                          className="px-3 py-1 rounded-md bg-gray-100 hover:bg-gray-200 text-sm"
-                        >
-                          Download
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
+            <div className="mt-4 space-y-2">
+              <h4 className="text-sm font-semibold text-slate-700">Saved Model Files</h4>
+              {modelPaths.map((path, index) => (
+                <div
+                  key={`${path}-${index}`}
+                  className="flex flex-col items-start justify-between gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm sm:flex-row sm:items-center"
+                >
+                  <span className="break-all text-slate-700">{path}</span>
+                  <a
+                    href={toFullUrl(path)}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="rounded-lg bg-emerald-600 px-3 py-1.5 font-semibold text-white hover:bg-emerald-700"
+                  >
+                    Open File
+                  </a>
+                </div>
+              ))}
             </div>
           )}
         </section>
