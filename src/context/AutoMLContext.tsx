@@ -58,7 +58,21 @@ function extractErrorMessage(payload: unknown, fallback: string): string {
   const asRecord = payload as Record<string, unknown>;
   const detail = asRecord.detail;
   if (typeof detail === "string") return detail;
-  if (Array.isArray(detail) && detail.length > 0) return JSON.stringify(detail);
+  if (Array.isArray(detail) && detail.length > 0) {
+    const messages = detail
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (!item || typeof item !== "object") return "";
+        const recordItem = item as Record<string, unknown>;
+        const itemMessage = recordItem.msg;
+        if (typeof itemMessage === "string") return itemMessage;
+        return "";
+      })
+      .filter(Boolean);
+
+    if (messages.length > 0) return messages.join("; ");
+    return JSON.stringify(detail);
+  }
   const message = asRecord.message;
   if (typeof message === "string") return message;
   return fallback;
@@ -105,8 +119,18 @@ export function AutoMLProvider({ children }: { children: React.ReactNode }): Rea
     if (pathOrUrl.startsWith("http://") || pathOrUrl.startsWith("https://")) {
       return pathOrUrl;
     }
-    if (pathOrUrl.startsWith("/")) return pathOrUrl;
-    return `/${pathOrUrl}`;
+
+    const normalizedPath = `/${pathOrUrl.replace(/^\/+/, "").replace(/\\/g, "/")}`;
+
+    if (apiBase.startsWith("http://") || apiBase.startsWith("https://")) {
+      try {
+        return new URL(normalizedPath, apiBase).toString();
+      } catch {
+        return normalizedPath;
+      }
+    }
+
+    return normalizedPath;
   };
 
   const retryHealthCheck = async () => {
